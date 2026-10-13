@@ -1,0 +1,147 @@
+# Graylog Open + Graylog Data Node, com MongoDB EXTERNO.
+#
+# - MongoDB NÃO faz parte deste compose: é um recurso separado (no Coolify) e
+#   chega aqui somente pela variável MONGODB_URI (ver docs/MONGODB.md).
+# - Todas as variáveis são fornecidas por .env (docker compose) ou pela aba
+#   "Environment Variables" do Coolify. Veja .env.example.
+# - Versões das imagens são sempre fixas (sem "latest").
+# - Documentação: README.md e docs/.
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Graylog Data Node: OpenSearch gerenciado pelo Graylog (índices das mensagens)
+  # ---------------------------------------------------------------------------
+  datanode:
+    image: "graylog/graylog-datanode:${DATANODE_VERSION:?Defina DATANODE_VERSION (ex.: 7.1.10)}"
+    # O hostname é registrado no MongoDB e usado pelo Graylog Server para falar
+    # com o Data Node (certificados do preflight incluem este nome). Não alterar
+    # depois do primeiro boot.
+    hostname: "datanode"
+    restart: unless-stopped
+    # Stop gracioso: o OpenSearch precisa de tempo para fechar shards/translog.
+    stop_grace_period: 120s
+    environment:
+      TZ: "${TZ:-America/Fortaleza}"
+      GRAYLOG_DATANODE_NODE_ID_FILE: "/var/lib/graylog-datanode/node-id"
+      # DEVE ser idêntico ao GRAYLOG_PASSWORD_SECRET do Graylog Server.
+      GRAYLOG_DATANODE_PASSWORD_SECRET: "${GRAYLOG_PASSWORD_SECRET:?Defina GRAYLOG_PASSWORD_SECRET (scripts/generate-password-secret.sh)}"
+      # DEVE ser exatamente a mesma URI usada pelo Graylog Server.
+      GRAYLOG_DATANODE_MONGODB_URI: "${MONGODB_URI:?Defina MONGODB_URI (docs/MONGODB.md)}"
+      # Heap do OpenSearch embutido (a imagem usa 1g se não definido).
+      GRAYLOG_DATANODE_OPENSEARCH_HEAP: "${DATANODE_HEAP:-2g}"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      # node-id, certificados/keystores e TODOS os dados dos índices.
+      - "graylog-datanode:/var/lib/graylog-datanode"
+    # Somente rede interna: API do Data Node (8999), OpenSearch HTTP (9200) e
+    # transporte (9300). NUNCA publicar com "ports:".
+    expose:
+      - "8999"
+      - "9200"
+      - "9300"
+    networks:
+      - graylog
+    # A imagem não traz healthcheck e não tem curl. Durante o preflight o
+    # OpenSearch ainda não existe (aguarda a configuração via UI do Graylog),
+    # mas a API do Data Node (8999) já responde; por isso o teste é um connect
+    # TCP nela. Falha de healthcheck NÃO reinicia o container (o Docker só marca
+    # "unhealthy"); a restart policy cobre apenas morte do processo.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8999"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # Graylog Server (Open): inputs SYSLOG, processamento, Web/API
+  # ---------------------------------------------------------------------------
+  graylog:
+    image: "graylog/graylog:${GRAYLOG_VERSION:?Defina GRAYLOG_VERSION (ex.: 7.1.10)}"
+    hostname: "graylog"
+    restart: unless-stopped
+    # Sem depends_on: o MongoDB é externo (não é um serviço deste compose) e o
+    # Graylog aguarda o MongoDB/Data Node sozinho (preflight). O Docker apenas
+    # reinicia o container se o processo morrer.
+    stop_grace_period: 60s
+    environment:
+      TZ: "${TZ:-America/Fortaleza}"
+      # node-id persistido dentro do volume /usr/share/graylog/data.
+      GRAYLOG_NODE_ID_FILE: "/usr/share/graylog/data/config/node-id"
+      # DEVE ser idêntico ao GRAYLOG_DATANODE_PASSWORD_SECRET do Data Node.
+      GRAYLOG_PASSWORD_SECRET: "${GRAYLOG_PASSWORD_SECRET:?Defina GRAYLOG_PASSWORD_SECRET (scripts/generate-password-secret.sh)}"
+      GRAYLOG_ROOT_PASSWORD_SHA2: "${GRAYLOG_ROOT_PASSWORD_SHA2:?Defina GRAYLOG_ROOT_PASSWORD_SHA2 (scripts/generate-admin-password-hash.sh)}"
+      GRAYLOG_HTTP_BIND_ADDRESS: "${GRAYLOG_HTTP_BIND_ADDRESS:-0.0.0.0:9000}"
+      GRAYLOG_HTTP_EXTERNAL_URI: "${GRAYLOG_HTTP_EXTERNAL_URI:?Defina GRAYLOG_HTTP_EXTERNAL_URI (ex.: https://graylog.example.com/)}"
+      GRAYLOG_MONGODB_URI: "${MONGODB_URI:?Defina MONGODB_URI (docs/MONGODB.md)}"
+      GRAYLOG_ROOT_TIMEZONE: "${GRAYLOG_ROOT_TIMEZONE:-America/Fortaleza}"
+      # Journal em disco persistente (dentro do volume graylog-data). Absorve
+      # rajadas (ex.: queda de enlace) e indisponibilidade do Data Node.
+      GRAYLOG_MESSAGE_JOURNAL_DIR: "/usr/share/graylog/data/journal"
+      GRAYLOG_MESSAGE_JOURNAL_MAX_SIZE: "${GRAYLOG_MESSAGE_JOURNAL_MAX_SIZE:-10gb}"
+      GRAYLOG_MESSAGE_JOURNAL_MAX_AGE: "${GRAYLOG_MESSAGE_JOURNAL_MAX_AGE:-24h}"
+      # A imagem já define um padrão (1g); o valor abaixo é ACRESCENTADO e,
+      # por vir por último, prevalece (-Xms/-Xmx).
+      GRAYLOG_SERVER_JAVA_OPTS: "${GRAYLOG_SERVER_JAVA_OPTS:--Xms2g -Xmx2g}"
+      # Usado somente pelo healthcheck abaixo (não é uma opção do Graylog).
+      HEALTHCHECK_ALLOW_PREFLIGHT: "${HEALTHCHECK_ALLOW_PREFLIGHT:-true}"
+    volumes:
+      # node-id, JOURNAL, content packs, plugins e libs nativas.
+      - "graylog-data:/usr/share/graylog/data"
+    # 9000: Web/API, atendida pelo proxy HTTPS do Coolify (domínio -> :9000).
+    #       Só "expose": não é publicada no host para não contornar o HTTPS.
+    expose:
+      - "9000"
+    # SYSLOG chega direto ao host/container, sem passar pelo proxy HTTP.
+    # A porta do host é igual à do container; o input criado no Graylog deve
+    # escutar nesta mesma porta (SYSLOG_PORT).
+    ports:
+      - "${SYSLOG_PORT:-5140}:${SYSLOG_PORT:-5140}/tcp"
+      - "${SYSLOG_PORT:-5140}:${SYSLOG_PORT:-5140}/udp"
+    networks:
+      - graylog
+    # /api/system/lbstatus é o endpoint oficial de saúde do Graylog (200 ALIVE).
+    # Durante o preflight (primeiro boot ou quando o Data Node ainda não foi
+    # provisionado) o servidor sobe só a UI de setup e esse endpoint devolve
+    # 404. Com HEALTHCHECK_ALLOW_PREFLIGHT=true esse 404 é aceito, para que o
+    # proxy do Coolify roteie para a UI de setup. Depois do setup, use "false"
+    # para exigir estritamente 200/ALIVE (ver docs/FIRST-BOOT.md).
+    # 503 (DEAD), 429 (THROTTLED) e falha de conexão => unhealthy.
+    # Não causa restart loop: o Docker não reinicia containers "unhealthy".
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          code=$$(curl -s -o /dev/null -m 3 -w '%{http_code}'
+          "http://127.0.0.1:$${GRAYLOG_HTTP_BIND_ADDRESS##*:}/api/system/lbstatus");
+          [ "$$code" = "200" ] ||
+          { [ "$$HEALTHCHECK_ALLOW_PREFLIGHT" = "true" ] && [ "$$code" = "404" ]; }
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 120s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+networks:
+  graylog:
+    driver: bridge
+
+volumes:
+  graylog-data:
+  graylog-datanode:
