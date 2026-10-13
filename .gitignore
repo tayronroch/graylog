@@ -1,0 +1,16 @@
+# Segredos / ambiente local (NUNCA commitar)
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Dados e backups locais
+data/
+backups/
+
+# Lixo de SO / editores
+.DS_Store
+.idea/
+.vscode/
